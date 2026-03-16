@@ -12,7 +12,13 @@ pub fn dequantize_aligned<Q: Scalar, S: CubePrimitive, F: Numeric, NQ: Size, NF:
     #[comptime] scheme: QuantScheme,
 ) -> Vector<F, NF> {
     let q_values = match scheme.store {
-        QuantStore::Native | QuantStore::PackedNative(_) => Vector::<F, NF>::cast_from(value),
+        QuantStore::Native => Vector::<F, NF>::cast_from(value),
+        QuantStore::PackedNative(_) => {
+            // PackedNative (e2m1x2): cast handles the packed→unpacked expansion.
+            // Vector<e2m1x2, NQ> → Vector<F, NF> where NF = NQ * packing.
+            // Codegen generates __nv_cvt_fp4x2_to_halfraw2 for the unpacking.
+            Vector::<F, NF>::cast_from(value)
+        }
         QuantStore::PackedU32(_) => unpack_cast_u32::<F, NQ, NF>(Vector::cast_from(value), scheme),
     };
     let scale = Vector::<F, NF>::cast_from(scale);

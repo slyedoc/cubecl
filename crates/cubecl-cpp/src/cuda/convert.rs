@@ -42,20 +42,27 @@ pub(crate) fn special_cast<D: Dialect>(
         input.elem().unpacked(),
         Elem::FP4(_) | Elem::FP6(_) | Elem::FP8(_)
     ) {
-        let mut item = out.item();
-        item.elem = match input.elem().unpacked() {
-            Elem::FP8(FP8Kind::UE8M0) => Elem::BF16,
-            _ => Elem::F16,
+        // Intermediate uses unpacked scalar half/bfloat types.
+        // Vectorization = input elements × packing factor (e.g. FP4x2 vec 1 → F16 vec 2).
+        let in_opt = input.optimized();
+        let packing = in_opt.item().packing_factor();
+        let item = Item {
+            elem: match input.elem().unpacked() {
+                Elem::FP8(FP8Kind::UE8M0) => Elem::BF16,
+                _ => Elem::F16,
+            },
+            vectorization: in_opt.item().vectorization * packing,
+            native: false,
         };
         let out_var = if item == out.item() {
             *out
         } else {
             Variable::tmp(item)
         };
-        if item.elem == Elem::F16 {
-            cast_minifloat_to_half(f, current_in, out_var)?;
-        } else {
+        if matches!(input.elem().unpacked(), Elem::FP8(FP8Kind::UE8M0)) {
             cast_scale_to_bfloat(f, current_in, out_var)?;
+        } else {
+            cast_minifloat_to_half(f, current_in, out_var)?;
         }
         current_in = out_var;
     }
@@ -272,14 +279,18 @@ fn float_to_packed<D: Dialect>(input: Variable<D>, i: usize, packing: usize) -> 
     }
 }
 
-/// Convert any FP8/6/4 except e8m0 to half
+/// Convert any FP8/6/4 except e8m0 to half.
+///
+/// For packed inputs (x2), each element produces 2 half values via halfraw2.
+/// The output is unpacked F16 with doubled vectorization, so we extract .x and .y
+/// from each half2 result into consecutive output slots.
 fn cast_minifloat_to_half<D: Dialect>(
     f: &mut fmt::Formatter,
     input: Variable<D>,
     out: Variable<D>,
 ) -> fmt::Result {
     let in_opt = input.optimized();
-    let out_opt = out.optimized().item();
+    let packed = in_opt.item().packing_factor() > 1;
 
     let (in_ty, interpretation) = match in_opt.elem() {
         Elem::FP4(kind) => ("fp4", format!("{kind:?}")),
@@ -291,51 +302,105 @@ fn cast_minifloat_to_half<D: Dialect>(
         _ => unreachable!("can only cast minifloat"),
     };
 
-    let out_ty = match out_opt.elem() {
-        Elem::F16 => "halfraw",
-        Elem::F16x2 => "halfraw2",
-        _ => unreachable!("out type must be half"),
-    };
+    if packed {
+        // Packed path: FP4x2/FP6x2/FP8x2 → halfraw2 → extract .x/.y into F16 output slots
+        let in_vec = in_opt.item().vectorization;
+        let out_item = out.item();
+        let out_var = out;
 
-    handle_unroll(f, out, |f, i| {
-        let input = in_opt.index(i);
-        write!(
-            f,
-            "{}(__nv_cvt_{in_ty}_to_{out_ty}({input}, __NV_{interpretation}))",
-            out_opt.elem()
-        )
-    })
+        // For vec > 1 output, wrap in struct initializer
+        if out_item.vectorization > 1 {
+            write!(f, "{} = {} {{\n", out_var.fmt_left(), out_item)?;
+        } else {
+            write!(f, "{} = ", out_var.fmt_left())?;
+        }
+
+        for i in 0..in_vec {
+            let input_elem = in_opt.index(i);
+            let cvt = format!(
+                "__half2(__nv_cvt_{in_ty}_to_halfraw2({input_elem}, __NV_{interpretation}))"
+            );
+            if out_item.vectorization > 1 {
+                // Two output slots per packed input element
+                // Conversion produces __half2 with .x and .y, but the output struct
+                // uses .i_N indexing. Extract via .x/.y from half2, assign to output slots.
+                write!(f, "{cvt}.x,\n{cvt}.y")?;
+                if i + 1 < in_vec {
+                    f.write_str(",\n")?;
+                }
+            } else {
+                write!(f, "{cvt}.x")?;
+            }
+        }
+
+        if out_item.vectorization > 1 {
+            f.write_str("\n}")?;
+        }
+        f.write_str(";\n")
+    } else {
+        // Unpacked path: FP4/FP6/FP8 → halfraw → wrap as __half
+        handle_unroll(f, out, |f, i| {
+            let input = in_opt.index(i);
+            write!(
+                f,
+                "{}(__nv_cvt_{in_ty}_to_halfraw({input}, __NV_{interpretation}))",
+                Elem::<D>::F16
+            )
+        })
+    }
 }
 
-/// Convert an e8m0 scaling factor to bf16
+/// Convert an e8m0 scaling factor to bf16.
+///
+/// For packed inputs (e8m0x2), each element produces 2 bf16 values.
+/// Output is unpacked BF16 with doubled vectorization.
 fn cast_scale_to_bfloat<D: Dialect>(
     f: &mut fmt::Formatter,
     input: Variable<D>,
     out: Variable<D>,
 ) -> fmt::Result {
     let in_opt = input.optimized();
-    let out_opt = out.optimized().item();
+    let packed = in_opt.item().packing_factor() > 1;
 
-    let in_ty = match in_opt.elem() {
-        Elem::FP8(_) => "e8m0",
-        Elem::FP8x2(_) => "e8m0x2",
-        _ => unreachable!("must be scaling factor in e8m0 format"),
-    };
+    if packed {
+        let in_vec = in_opt.item().vectorization;
+        let out_item = out.item();
 
-    let out_ty = match out_opt.elem() {
-        Elem::BF16 => "bf16raw",
-        Elem::BF16x2 => "bf162raw",
-        _ => unreachable!("out type must be half"),
-    };
+        if out_item.vectorization > 1 {
+            write!(f, "{} = {} {{\n", out.fmt_left(), out_item)?;
+        } else {
+            write!(f, "{} = ", out.fmt_left())?;
+        }
 
-    handle_unroll(f, out, |f, i| {
-        let input = in_opt.index(i);
-        write!(
-            f,
-            "{}(__nv_cvt_{in_ty}_to_{out_ty}({input}))",
-            out_opt.elem()
-        )
-    })
+        for i in 0..in_vec {
+            let input_elem = in_opt.index(i);
+            let cvt = format!(
+                "__nv_bfloat162(__nv_cvt_e8m0x2_to_bf162raw({input_elem}))"
+            );
+            if out_item.vectorization > 1 {
+                write!(f, "{cvt}.x,\n{cvt}.y")?;
+                if i + 1 < in_vec {
+                    f.write_str(",\n")?;
+                }
+            } else {
+                write!(f, "{cvt}.x")?;
+            }
+        }
+
+        if out_item.vectorization > 1 {
+            f.write_str("\n}")?;
+        }
+        f.write_str(";\n")
+    } else {
+        handle_unroll(f, out, |f, i| {
+            let input = in_opt.index(i);
+            write!(
+                f,
+                "{}(__nv_cvt_e8m0_to_bf16raw({input}))",
+                Elem::<D>::BF16
+            )
+        })
+    }
 }
 
 fn handle_unroll<D: Dialect>(

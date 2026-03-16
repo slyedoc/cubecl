@@ -209,6 +209,17 @@ impl ElemType {
         }
     }
 
+    /// Maximum vector size (line size) that backends can compile for this element type.
+    /// Sub-byte types like E2M1 (FP4) have limited native vector support in CUDA:
+    /// after FP4→FP4x2 optimization, vec N becomes FP4x2 vec N/2, and CUDA only
+    /// supports FP4x2 as a scalar (1-byte) type.
+    pub const fn max_vector_size(&self) -> u8 {
+        match self {
+            ElemType::Float(FloatKind::E2M1) => 2,
+            _ => u8::MAX,
+        }
+    }
+
     pub fn is_int(&self) -> bool {
         matches!(self, ElemType::Int(_) | ElemType::UInt(_) | ElemType::Bool)
     }

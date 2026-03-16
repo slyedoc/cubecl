@@ -264,7 +264,14 @@ pub fn into_contiguous_packed<R: Runtime>(
         return into_contiguous(client, input, dtype);
     }
 
+    // The output has the packed dim moved to innermost (last) position,
+    // and that dim is divided by the packing factor.
+    let in_packed_dim_idx = rank - packed_dim - 1; // convert from-innermost to standard index
     let mut out_shape = shape.to_vec();
+    if in_packed_dim_idx != rank - 1 {
+        // Move packed dim to last position
+        out_shape.swap(in_packed_dim_idx, rank - 1);
+    }
     out_shape[rank - 1] = out_shape[rank - 1].div_ceil(packing);
     let output = TensorHandle::empty(client, out_shape, dtype);
 
@@ -389,41 +396,19 @@ pub fn into_contiguous_packed_ref<R: Runtime>(
 ) {
     let num_elems: usize = input.shape.iter().product();
 
-    // Vectorization is only enabled when the last dimension is contiguous.
     let in_rank = input.strides.len();
     let out_rank = output.strides.len();
     let in_packed_dim = in_rank - packed_dim - 1;
-    let vector_size = tensor_vector_size_parallel(
-        client.io_optimized_vector_sizes(dtype.size()),
-        &output.shape,
-        &output.strides,
-        out_rank - 1,
-    );
-    let num_vecs = num_elems / vector_size as usize;
-    let num_sm = client
-        .properties()
-        .hardware
-        .num_streaming_multiprocessors
-        .unwrap_or(NUM_SM_APPROX);
+
+    // For packed copy, use vector_size=1 for simplicity and correctness.
+    // The packed copy is a re-arrangement operation, not a bulk transfer —
+    // performance is not critical.
+    let vector_size: usize = 1;
+    let elems_per_unit: usize = 1;
+    let num_elems_per_unit = 1;
+    let num_vecs = num_elems;
 
     let cube_dim = CubeDim::new(client, num_vecs);
-    let simul_vecs = num_sm * cube_dim.num_elems();
-    let mut elems_per_unit = match num_vecs / simul_vecs as usize {
-        0..2 => 1,
-        2..4 => 2,
-        4..8 => 4,
-        8.. => 8,
-    };
-
-    let mut num_elems_per_unit = vector_size as usize * elems_per_unit;
-
-    let last_dim = output.shape[out_rank - 1];
-
-    // If tensor is strided, elems_per_unit must be compatible with last dim
-    while !last_dim.is_multiple_of(num_elems_per_unit as usize) {
-        elems_per_unit /= 2;
-        num_elems_per_unit /= 2;
-    }
 
     let out_layout = LinearLayoutArgs::from_handle(client, &output, vector_size);
 

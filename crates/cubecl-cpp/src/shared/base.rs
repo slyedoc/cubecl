@@ -1592,7 +1592,11 @@ impl<D: Dialect> CppCompiler<D> {
                 self.flags.elem_f16 = true;
                 self.flags.elem_bf16 = true;
                 let vec_in = op.input.ty.vector_size();
-                let packing = out.storage_type().packing_factor();
+                let packing_out = out.storage_type().packing_factor();
+                let packing_in = op.input.ty.storage_type().packing_factor();
+                let packing = packing_out.max(packing_in);
+                // Intermediate for packed→unpacked expansion: F16/BF16 vec (vec_in * packing)
+                let vec_expanded = vec_in * packing;
                 self.compile_type(op.input.ty.with_vector_size(packing));
                 self.compile_type(
                     gpu::Type::scalar(gpu::ElemType::Float(FloatKind::F16))
@@ -1610,6 +1614,18 @@ impl<D: Dialect> CppCompiler<D> {
                     gpu::Type::scalar(gpu::ElemType::Float(FloatKind::BF16))
                         .with_vector_size(packing),
                 );
+                self.compile_type(
+                    gpu::Type::scalar(gpu::ElemType::Float(FloatKind::F16))
+                        .with_vector_size(vec_expanded),
+                );
+                self.compile_type(
+                    gpu::Type::scalar(gpu::ElemType::Float(FloatKind::BF16))
+                        .with_vector_size(vec_expanded),
+                );
+                // Also register the output type at the expanded size — needed when the
+                // cast output has a different vector size from the original output variable
+                // (e.g. Packed(E2M1, 2) scalar → f32 vec 2)
+                self.compile_type(out.ty.with_vector_size(vec_expanded));
 
                 let inst = self.compile_unary(op, out);
 
